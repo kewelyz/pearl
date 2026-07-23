@@ -1,0 +1,19 @@
+# Rahasia & konfigurasi lokal (JANGAN di-commit)
+.env
+*.env
+!.env.example
+
+# Log & runtime
+*.log
+*.pid
+.pearl-miner/
+
+# Wallet / seed (jangan pernah masuk repo)
+*.wallet
+*.seed
+wallet.db
+
+# OS / editor
+.DS_Store
+*.bak
+*.swp
