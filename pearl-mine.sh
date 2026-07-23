@@ -9,6 +9,7 @@
 #  Pemakaian:
 #     ./pearl-mine.sh doctor     # cek prasyarat (GPU, driver, docker, dll)
 #     ./pearl-mine.sh install    # pasang binary pearl (pearld/oyster/prlctl)
+#     ./pearl-mine.sh build      # build vLLM miner dari source (tanpa Docker, pakai uv)
 #     ./pearl-mine.sh wallet     # buat wallet + generate alamat mining (prl1...)
 #     ./pearl-mine.sh node       # jalankan full node (pearld)
 #     ./pearl-mine.sh miner      # jalankan vLLM miner (GPU) via Docker
@@ -102,8 +103,28 @@ cmd_doctor() {
       warn "Miner Pearl HANYA mendukung sm90 (H100/H200). GPU lain akan ditolak."
     fi
   else
-    err "nvidia-smi TIDAK ditemukan. Pasang NVIDIA driver dulu."
-    fail=1
+    warn "nvidia-smi tidak ada (umum di container). Cek GPU via CUDA/torch ..."
+    if python3 - <<'PY' 2>/dev/null
+import sys
+try:
+    import torch
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability(0)
+        print(f"    GPU (torch): {torch.cuda.get_device_name(0)}  cap {cc[0]}.{cc[1]}")
+        sys.exit(0 if cc == (9, 0) else 3)
+    sys.exit(1)
+except Exception:
+    sys.exit(2)
+PY
+    then
+      ok "GPU terdeteksi via CUDA dengan compute cap 9.0 (H100/H200) -> DIDUKUNG"
+    else
+      case $? in
+        3) warn "GPU terdeteksi via CUDA tapi BUKAN sm90. Pearl hanya mendukung H100/H200." ;;
+        1) err "Tidak ada GPU CUDA aktif."; fail=1 ;;
+        *) err "Tidak bisa cek GPU (torch/nvidia-smi tidak ada). Pastikan ini instance GPU."; fail=1 ;;
+      esac
+    fi
   fi
 
   # Docker (untuk vLLM miner)
@@ -225,42 +246,101 @@ cmd_node() {
 }
 
 # ============================================================================
-#  miner  --  jalankan vLLM miner (GPU) via Docker
+#  build  --  clone repo resmi + build vLLM miner dari source (tanpa Docker)
 # ============================================================================
-cmd_miner() {
-  hr; info "Menjalankan vLLM miner (GPU)"; hr
-  need docker || die "docker diperlukan untuk cara ini. Lihat README bagian 'tanpa Docker'."
-  [[ -n "${HF_TOKEN:-}" ]] || warn "HF_TOKEN kosong. Model mungkin gagal diunduh dari HuggingFace."
+PEARL_SRC="${PEARL_SRC:-$HOME/pearl-src}"
 
-  local rpc_url="http://${PEARLD_RPC_HOST}:${PEARLD_RPC_PORT}"
-  local image="ghcr.io/pearl-research-labs/vllm_miner:latest"
+cmd_build() {
+  hr; info "Menyiapkan vLLM miner dari source (jalur tanpa Docker)"; hr
+  need git || die "git tidak ada."
+  need uv  || die "uv tidak ada. Pasang: curl -LsSf https://astral.sh/uv/install.sh | sh"
 
-  info "Menarik image miner: $image"
-  if ! docker pull "$image" 2>/dev/null; then
-    warn "Gagal pull image prebuilt. Membangun dari source repo ..."
-    [[ -d "${SCRIPT_DIR}/pearl" ]] || die "Repo pearl tidak ada di ${SCRIPT_DIR}/pearl. Clone dulu: git clone https://github.com/pearl-research-labs/pearl"
-    ( cd "${SCRIPT_DIR}/pearl" && docker buildx build -t vllm_miner:latest . -f miner/vllm-miner/Dockerfile )
-    image="vllm_miner:latest"
+  # cek toolchain wajib untuk kompilasi kernel
+  need nvcc  || warn "nvcc (CUDA toolkit) tidak terdeteksi -> build kernel pearl-gemm bisa gagal."
+  need rustc || warn "rustc (Rust) tidak terdeteksi -> dependency py-pearl-mining bisa gagal."
+
+  if [[ ! -d "$PEARL_SRC/.git" ]]; then
+    info "Clone repo resmi ke $PEARL_SRC ..."
+    git clone --depth 1 https://github.com/pearl-research-labs/pearl "$PEARL_SRC"
+  else
+    info "Repo resmi sudah ada di $PEARL_SRC"
   fi
 
-  info "Menjalankan container miner (model: $MODEL) ..."
+  info "Kompilasi vllm-miner + kernel pearl-gemm (bisa 10-30 menit) ..."
+  ( cd "$PEARL_SRC" && uv sync --package vllm-miner )
+  ok "Build miner selesai."
+}
+
+# ============================================================================
+#  miner  --  jalankan vLLM miner (GPU). Auto: pakai Docker jika ada,
+#             kalau tidak -> jalur source (pearl-gateway + uv run vllm serve)
+# ============================================================================
+cmd_miner() {
+  hr; info "Menjalankan vLLM miner (GPU) -- model: $MODEL"; hr
+  [[ -n "${MINING_ADDRESS:-}" ]] || die "MINING_ADDRESS kosong. Jalankan: $0 wallet"
+  [[ -n "${HF_TOKEN:-}" ]] || warn "HF_TOKEN kosong. Model mungkin gagal diunduh dari HuggingFace."
+  local rpc_url="http://${PEARLD_RPC_HOST}:${PEARLD_RPC_PORT}"
+
+  if need docker; then
+    _miner_docker "$rpc_url"
+  else
+    warn "Docker tidak ada -> memakai jalur source (uv)."
+    _miner_source "$rpc_url"
+  fi
+}
+
+_miner_docker() {
+  local rpc_url="$1"
+  local image="ghcr.io/pearl-research-labs/vllm_miner:latest"
+  info "Menarik image miner: $image"
+  if ! docker pull "$image" 2>/dev/null; then
+    warn "Gagal pull image. Membangun image dari source ..."
+    [[ -d "$PEARL_SRC" ]] || cmd_build
+    ( cd "$PEARL_SRC" && docker buildx build -t vllm_miner:latest . -f miner/vllm-miner/Dockerfile )
+    image="vllm_miner:latest"
+  fi
   docker run --rm -d --name pearl-miner \
     --gpus all --network host --shm-size 8g \
-    -e PEARLD_RPC_URL="$rpc_url" \
-    -e PEARLD_RPC_USER="$RPC_USER" \
-    -e PEARLD_RPC_PASSWORD="$RPC_PASS" \
-    -e PEARLD_MINING_ADDRESS="$MINING_ADDRESS" \
+    -e PEARLD_RPC_URL="$rpc_url" -e PEARLD_RPC_USER="$RPC_USER" \
+    -e PEARLD_RPC_PASSWORD="$RPC_PASS" -e PEARLD_MINING_ADDRESS="$MINING_ADDRESS" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-    "$image" \
-    "$MODEL" \
+    "$image" "$MODEL" \
     --host 0.0.0.0 --port 8000 \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
     --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-    --enforce-eager
-  ok "Container 'pearl-miner' berjalan. Lihat log: docker logs -f pearl-miner"
-  info "Unduhan model 70B pertama kali bisa lama (~140GB). Sabar ya."
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --enforce-eager
+  ok "Container 'pearl-miner' berjalan. Log: docker logs -f pearl-miner"
+}
+
+_miner_source() {
+  local rpc_url="$1"
+  [[ -d "$PEARL_SRC" ]] || { warn "Miner belum di-build."; cmd_build; }
+
+  export PEARLD_RPC_URL="$rpc_url"
+  export PEARLD_RPC_USER="$RPC_USER"
+  export PEARLD_RPC_PASSWORD="$RPC_PASS"
+  export PEARLD_MINING_ADDRESS="$MINING_ADDRESS"
+  export HF_TOKEN="${HF_TOKEN:-}"
+
+  # 1) pearl-gateway (jembatan node <-> miner) di background
+  info "Menjalankan pearl-gateway ..."
+  ( cd "$PEARL_SRC" && uv run pearl-gateway start ) >"$LOG_DIR/gateway.log" 2>&1 &
+  echo $! > "$LOG_DIR/gateway.pid"
+  sleep 5
+
+  # 2) vllm serve dengan plugin pearl
+  info "Menjalankan vllm serve (unduhan model ~140GB pertama kali bisa lama) ..."
+  ( cd "$PEARL_SRC" && uv run vllm serve "$MODEL" \
+      --host 0.0.0.0 --port 8000 \
+      --tensor-parallel-size "$TENSOR_PARALLEL" \
+      --max-model-len "$MAX_MODEL_LEN" \
+      --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+      --enforce-eager ) >"$LOG_DIR/vllm.log" 2>&1 &
+  echo $! > "$LOG_DIR/vllm.pid"
+  sleep 3
+  ok "Miner (source) berjalan. Log gateway: $LOG_DIR/gateway.log | vllm: $LOG_DIR/vllm.log"
+  info "Pantau: tail -f $LOG_DIR/vllm.log"
 }
 
 # ============================================================================
@@ -292,7 +372,7 @@ cmd_stop() {
   if need docker && docker ps --format '{{.Names}}' | grep -q '^pearl-miner$'; then
     docker stop pearl-miner >/dev/null && ok "Container miner dihentikan."
   fi
-  for svc in pearld oyster; do
+  for svc in vllm gateway pearld oyster; do
     if [[ -f "$LOG_DIR/$svc.pid" ]] && kill -0 "$(cat "$LOG_DIR/$svc.pid")" 2>/dev/null; then
       kill "$(cat "$LOG_DIR/$svc.pid")" && ok "$svc dihentikan."
       rm -f "$LOG_DIR/$svc.pid"
@@ -330,6 +410,7 @@ main() {
   case "$sub" in
     doctor)  load_env; cmd_doctor ;;
     install) load_env; cmd_install ;;
+    build)   load_env; cmd_build ;;
     wallet)  load_env; cmd_wallet ;;
     node)    load_env; cmd_node ;;
     miner)   load_env; cmd_miner ;;
