@@ -107,3 +107,92 @@ def wallet(passphrase: str = "ganti-passphrase-anda"):
     print("ADDRESS MINING (boleh dibagikan, ini alamat penerima reward):")
     print("   ", res["address"])
     print("=" * 64)
+
+
+# ============================================================================
+#  MINING
+# ============================================================================
+MODEL = "pearl-ai/Llama-3.3-70B-Instruct-pearl"
+
+# Image miner: CUDA 13.0.3 devel (Ubuntu 24.04) + rust + uv + node + miner build.
+# Mengikuti Dockerfile & miner/README.md resmi ("uv sync --package vllm-miner").
+miner_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.3-devel-ubuntu24.04",
+        add_python="3.12",
+    )
+    .apt_install("curl", "git", "build-essential", "ca-certificates", "pkg-config")
+    .run_commands(
+        "curl -LsSf https://astral.sh/uv/install.sh | sh",
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        "curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/"
+        f"master/install.sh | sh -s -- --version {PEARL_VER}",
+        "git clone --depth 1 https://github.com/pearl-research-labs/pearl /opt/pearl",
+    )
+    .env({
+        "PATH": "/root/.local/bin:/root/.cargo/bin:/usr/local/cuda/bin:${PATH}",
+        "UV_TORCH_BACKEND": "cu130",
+        "CARGO_HOME": "/root/.cargo",
+        "RUSTUP_HOME": "/root/.rustup",
+    })
+    # Build miner (torch + vLLM + kompilasi kernel pearl-gemm sm90). Lama (~20-40 mnt).
+    .run_commands("cd /opt/pearl && uv sync --package vllm-miner")
+)
+
+
+@app.function(
+    image=miner_image,
+    gpu="H200",
+    volumes={DATA: vol},
+    timeout=60 * 60 * 24,                       # maksimum Modal 24 jam; jalankan ulang untuk lanjut
+    secrets=[modal.Secret.from_name("huggingface")],  # berisi HF_TOKEN
+)
+def mine(address: str):
+    """Jalankan node pearld + gateway + vLLM miner di 1 GPU H200."""
+    import os, subprocess, time
+
+    os.makedirs(NODEDATA, exist_ok=True)
+    os.makedirs(f"{DATA}/hf", exist_ok=True)
+
+    env = {
+        **os.environ,
+        "PEARLD_RPC_URL": "http://127.0.0.1:44107",
+        "PEARLD_RPC_USER": RPC_USER,
+        "PEARLD_RPC_PASSWORD": RPC_PASS,
+        "PEARLD_MINING_ADDRESS": address,
+        "HF_HOME": f"{DATA}/hf",                 # cache model 70B -> persisten di volume
+    }
+
+    # 1) Node pearld (RPC tanpa TLS -> gateway konek via http), data di volume.
+    print(">> start pearld ...")
+    subprocess.Popen(
+        ["pearld", "--notls", "--rpclisten=127.0.0.1:44107",
+         "-u", RPC_USER, "-P", RPC_PASS,
+         f"--datadir={NODEDATA}", f"--miningaddr={address}", "--txindex"],
+    )
+    time.sleep(15)
+
+    # 2) pearl-gateway (jembatan node <-> miner), buat socket /tmp/pearlgw.sock.
+    print(">> start pearl-gateway ...")
+    subprocess.Popen(["uv", "run", "pearl-gateway", "start"], cwd="/opt/pearl", env=env)
+    for _ in range(60):
+        if os.path.exists("/tmp/pearlgw.sock"):
+            break
+        time.sleep(2)
+
+    # 3) vLLM serve dengan plugin Pearl (unduh model ~140GB pertama kali).
+    print(">> start vllm serve (mining) ...")
+    subprocess.run(
+        ["uv", "run", "vllm", "serve", MODEL,
+         "--host", "0.0.0.0", "--port", "8000",
+         "--max-model-len", "8192",
+         "--gpu-memory-utilization", "0.9",
+         "--enforce-eager"],
+        cwd="/opt/pearl", env=env,
+    )
+
+
+@app.local_entrypoint()
+def start_mining(address: str):
+    """modal run pearl_app.py::start_mining --address prl1...."""
+    mine.remote(address)
