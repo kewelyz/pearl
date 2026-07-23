@@ -153,9 +153,30 @@ PY
 # ============================================================================
 cmd_install() {
   hr; info "Memasang binary Pearl (pearld, oyster, prlctl, oystercli)"; hr
-  if ! need curl; then die "curl tidak ada. Pasang curl dulu."; fi
-  info "Mengunduh installer resmi dari pearl-research-labs ..."
-  curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
+  need curl || die "curl tidak ada. Pasang curl dulu."
+
+  # Installer resmi minta "latest release", tapi rilis terbaru di GitHub sering
+  # berupa rilis WALLET (tag: pearl-wallet-vX.Y.Z) yang formatnya ditolak installer.
+  # Jadi kita deteksi sendiri versi NODE terbaru (tag persis "vX.Y.Z").
+  local ver="${PEARL_VERSION:-}"
+  if [[ -z "$ver" ]]; then
+    info "Mendeteksi versi node terbaru (tag vX.Y.Z) dari GitHub ..."
+    ver="$(curl -fsSL "https://api.github.com/repos/pearl-research-labs/pearl/releases?per_page=100" 2>/dev/null \
+          | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' \
+          | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' \
+          | sort -V | tail -1 || true)"
+  fi
+
+  local installer="https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh"
+  if [[ -n "$ver" ]]; then
+    info "Memasang versi node: $ver"
+    curl -fsSL "$installer" | sh -s -- --version "$ver"
+  else
+    warn "Deteksi versi otomatis gagal. Coba tanpa --version (mungkin error jika latest = wallet)."
+    warn "Kalau gagal, set manual di .env: PEARL_VERSION=v1.1.6  lalu ulangi."
+    curl -fsSL "$installer" | sh
+  fi
+
   hash -r 2>/dev/null || true
   if need pearld; then
     ok "Instalasi selesai. Binary ada di: ${PEARL_BIN_DIR}"
