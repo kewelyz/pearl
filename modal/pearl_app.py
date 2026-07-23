@@ -193,7 +193,11 @@ def mine(address: str):
     )
 
 
+# Address mining default (punya Anda). Bisa ditimpa dengan --address prl1...
+DEFAULT_ADDRESS = "prl1pltfqmlc8zy6kwgades7ys5x3w3ft3glvl9fztfksrevsh3nw7sgsjtpqxq"
+
+
 @app.local_entrypoint()
-def start_mining(address: str):
-    """modal run pearl_app.py::start_mining --address prl1...."""
+def start_mining(address: str = DEFAULT_ADDRESS):
+    """modal run --detach pearl_app.py::start_mining  [--address prl1...]"""
     mine.remote(address)
