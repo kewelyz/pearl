@@ -48,7 +48,7 @@ image = (
 app = modal.App("pearl", image=image)
 
 
-@app.function(volumes={DATA: vol}, timeout=1800)
+@app.function(volumes={DATA: vol}, timeout=1800, max_containers=1, retries=0)
 def create_wallet(passphrase: str):
     """Buat wallet baru (SPV) di volume, lalu kembalikan seed phrase + address."""
     import os, time, subprocess, pexpect
@@ -147,6 +147,8 @@ miner_image = (
     volumes={DATA: vol},
     timeout=60 * 60 * 24,                       # maksimum Modal 24 jam; jalankan ulang untuk lanjut
     secrets=[modal.Secret.from_name("huggingface")],  # berisi HF_TOKEN
+    max_containers=1,                            # IRIT: jangan pernah auto-scale > 1 container
+    retries=0,                                   # jangan spawn ulang otomatis (hemat request)
 )
 def mine(address: str):
     """Jalankan node pearld + gateway + vLLM miner di 1 GPU H200."""
